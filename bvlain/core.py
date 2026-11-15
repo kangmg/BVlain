@@ -5,20 +5,16 @@ import re
 import sys
 import json
 import pickle
-import itertools
 import numpy as np
-import pandas as pd
-from joblib import Parallel, delayed
 from scipy.spatial import cKDTree
-from scipy.ndimage import measurements, generate_binary_structure
 from ase.neighborlist import neighbor_list
 from ase.io import read, cube
 from ase.build import make_supercell
 from ase.data import atomic_numbers
-from pymatgen.analysis.bond_valence import BVAnalyzer
-from pymatgen.io.ase import AseAtomsAdaptor
 from .potentials import BVSEPotential
 from .data.covalent_radii import get_covalent_radii
+from . import kernels
+from . import percolation
 
 
 
@@ -70,8 +66,11 @@ class Lain:
 
         """
         
+        from pymatgen.io.ase import AseAtomsAdaptor
+
         self.st = st
         if oxi_check:
+            from pymatgen.analysis.bond_valence import BVAnalyzer
             bva = BVAnalyzer(forbidden_species = forbidden_species)
             self.st = bva.get_oxi_state_decorated_structure(self.st)
         self.atoms_copy = AseAtomsAdaptor.get_atoms(self.st)
@@ -105,6 +104,8 @@ class Lain:
         stores ase.atoms in self.atoms_copy
 
         """
+        from pymatgen.io.ase import AseAtomsAdaptor
+
         st = AseAtomsAdaptor().get_structure(atoms)
         self.read_structure(st, oxi_check=oxi_check, forbidden_species=forbidden_species)
         return self.atoms_copy
@@ -198,11 +199,9 @@ class Lain:
             Matrix of the unit cell transformation
         
         """
-        # a, b, c, angle(b,c), angle(a,c), angle(a,b)
-        a, b, c, alpha, beta, gamma = cell.cellpar(radians = True) 
-        scale_a = 2*np.ceil(r_cut/min(a*np.sin(gamma), a*np.sin(beta))) + 1
-        scale_b = 2*np.ceil(r_cut/min(b*np.sin(gamma), b*np.sin(beta))) + 1
-        scale_c = 2*np.ceil(r_cut/min(c*np.sin(beta), c*np.sin(beta))) + 1
+        # distances between the opposite faces of the unit cell
+        heights = 1 / np.linalg.norm(np.linalg.inv(np.array(cell)), axis = 0)
+        scale_a, scale_b, scale_c = 2 * np.ceil(r_cut / heights) + 1
         scale = np.vstack([[scale_a, 0, 0], [0, scale_b, 0], [0, 0, scale_c]])
         return scale
 
@@ -438,31 +437,15 @@ class Lain:
         ----------
 
         dim: int
-            dimensionality of percolation (from 1 to 27)
+            dimensionality of percolation. 2 -> 1D, 4 -> 2D, 8 - 3D percolation
             
         Returns
         ----------
         percolation_radius: float
-            percolation energy or np.inf if no percolation found
+            percolation radius or 0 if no percolation found
         """
         
-        data = np.where(self.void_data > 0, self.void_data, 0)
-        emax = data.max()
-        emin = 0
-        radii = 0
-        while (emax - emin) > 0.1:
-            probe = (emin + emax) / 2
-            labels, features = self._connected_components(data, probe, task = 'void')
-            if len(features) > 0:
-                d = self._percolation_dimension(labels, features)
-                if d >= dim:
-                    emin = probe
-                    radii = round(emin,4)
-                else:
-                    emax = probe
-            else:
-                emax = probe
-        return radii
+        return percolation.percolation_radius(self.void_data, dim)
 
 
 
@@ -574,12 +557,15 @@ class Lain:
     
     
     def bvse_distribution(self, mobile_ion = None, r_cut = 10,
-                          resolution = 0.2, k = 100, f = 0.74, use_softbv_covalent_radii = False):
+                          resolution = 0.2, k = None, f = 0.74, use_softbv_covalent_radii = False,
+                          exact = False):
         
         """ 
         Calculate BVSE distribution for a given mobile ion.
-        Note! It is a vectorized method. Works fast, but memory expensive.
-        Never ever set resolution parameter lower then 0.05.
+
+        By default all framework ions within r_cut are taken into account.
+        The calculation is done by the compiled kernel (see bvlain.kernels),
+        its memory consumption does not depend on the number of neighbors.
 
 
         Parameters
@@ -594,14 +580,23 @@ class Lain:
         r_cut: float, 10.0 by default
             maximum distances for mobile ion - framework interaction
             
-        k: int, 100 by default
-            maximum number of neighbours (used for KDTree search of neighbors)
+        k: int, None by default
+            if None, all framework ions within r_cut are considered.
+            if int, only k nearest framework ions within r_cut are considered
+            (KDTree search of neighbors, the behavior of the versions up to 0.25.1, k = 100).
+            Note! This option is vectorized over (grid points, k). Works slower and it is
+            memory expensive. Never ever set resolution parameter lower then 0.05 with it.
 
         f: float, 0.74 by default
             screening factor
 
         use_softbv_covalent_radii: boolean, False by default
             use ASE or softBV covalent radii data
+
+        exact: boolean, False by default
+            used when k is None.
+            if False, pair energies are interpolated from the tables (cubic interpolation,
+            relative error is below 1e-8), otherwise they are calculated explicitly (slower)
         
         Returns
         ----------
@@ -616,6 +611,100 @@ class Lain:
             print('getting BVSE distribution...')
         
         self._get_params(mobile_ion, use_softbv_covalent_radii = use_softbv_covalent_radii)
+        if k is None:
+            energy = self._bvse_kernel(r_cut = r_cut, resolution = resolution, f = f, exact = exact)
+        else:
+            energy = self._bvse_neighbors(r_cut = r_cut, resolution = resolution, k = k, f = f)
+        self.distribution = energy.ravel()
+        self.data = energy.reshape(self.size)
+        if self.verbose:
+            print('distribution is ready\n')
+        return self.data
+
+
+
+    def _bvse_kernel(self, r_cut = 10.0, resolution = 0.2, f = 0.74, exact = False):
+
+        """ 
+        Calculate BVSE distribution considering all framework ions within r_cut.
+
+        Parameters
+        ----------
+
+        r_cut: float
+            maximum distances for mobile ion - framework interaction
+
+        resolution: float
+            distance between grid points
+
+        f: float
+            screening factor
+
+        exact: boolean
+            interpolate (False) or calculate explicitly (True) pair energies
+
+        Returns
+        ----------
+
+        energy: np.array of self.size shape
+            BVSE distribution
+        """
+
+        if self.verbose:
+            print('\tsumming up pair interactions...')
+
+        # grid points within the unit cell, no supercell is constructed
+        self._cartesian_sites(self._mesh(resolution = resolution, shift = [0, 0, 0]))
+        self.supercell = None
+
+        atoms = self.atoms
+        kind, p1, p2, p3 = kernels.pair_params(atoms.get_array('oxi_states'),
+                                               atoms.get_array('r_min'),
+                                               atoms.get_array('alpha'),
+                                               atoms.get_array('d0'),
+                                               atoms.get_array('r_c'),
+                                               atoms.get_array('n'),
+                                               self.q_mi, self.rc_mi, self.n_mi, f = f)
+        # The mesh includes both end points of each axis (see self._mesh), i.e. the last
+        # plane is a periodic copy of the first one. Only unique points are calculated.
+        periods = [max(n - 1, 1) for n in self.size]
+        energy = kernels.bvse_grid(np.array(self.cell),
+                                   atoms.get_scaled_positions(),
+                                   periods, kind, p1, p2, p3,
+                                   r_cut = r_cut, exact = exact)
+        ids = [np.arange(n) % period for n, period in zip(self.size, periods)]
+        return energy[np.ix_(*ids)]
+
+
+
+    def _bvse_neighbors(self, r_cut = 10.0, resolution = 0.2, k = 100, f = 0.74):
+
+        """ 
+        Calculate BVSE distribution considering k nearest framework ions within r_cut.
+        Note! It is a vectorized method. Memory expensive.
+
+        Parameters
+        ----------
+
+        r_cut: float
+            maximum distances for mobile ion - framework interaction
+
+        resolution: float
+            distance between grid points
+
+        k: int
+            maximum number of neighbours (used for KDTree search of neighbors)
+
+        f: float
+            screening factor
+
+        Returns
+        ----------
+
+        energy: np.array
+            BVSE distribution
+        """
+
         _, distances, ids, numbers =  self._neighbors(r_cut = r_cut,
                                                      resolution = resolution,
                                                      k = k)
@@ -637,210 +726,10 @@ class Lain:
                                                       self.n_mi, n, f = f),
                                  copy = False,
                                  nan = 0.0).sum(axis = 1)
-        energy = morse + coulomb
-        self.distribution = energy
-        self.data = energy.reshape(self.size)
-        if self.verbose:
-            print('distribution is ready\n')
-        return self.data
-    
-
-    
-    def _cross_boundary(self, coords, data_shape):
-        
-        """ 
-        Check if connected component crosses the boundary of unit cell
-
-        Parameters
-        ----------
-
-        coords: np.array
-            coordinates of points in connected component
-            
-        data_shape: list
-            shape of the mesh constructed over supercell
-        
-        Returns
-        ----------
-        
-        d: int
-            number of unit cells within a supercell that contains connected component
-        """
-
-        probe = coords[0, :]
-        cell_location = np.floor(probe / data_shape)
-        translations = np.array(list(itertools.product([0, 1],
-                                                       [0, 1],
-                                                       [0, 1])))
-        translations = translations - cell_location
-        test = probe + translations * data_shape
-        d = np.argwhere(abs(coords[:, None] - test).sum(axis = 2) == 0).shape[0]
-        return d
-
-    
-
-    def _connected_components(self, data, tr, task = 'bvse'): 
-
-        """ 
-        Find connected components
-
-        Parameters
-        ----------
-
-        data: np.array
-            BVSE distribution data
-            
-        tr: float
-            energy threshold to find components
-
-        task: str, either "bvse" or "void"
-            select type of calculation 
-         
-        Returns
-        ----------
-        
-        labels, features: np.array, number of components
-            labels are data points colored to features values
-        """
-
-        n = 2
-        lx, ly, lz = data.shape
-        superdata = np.zeros((n * lx, n * ly, n * lz))
-        for i in range(n):
-            for j in range(n):
-                for k in range(n):
-                    superdata[i*lx:(i+1)*lx, j*ly:(j+1)*ly, k*lz:(k+1)*lz] = data
-
-        region = superdata - superdata.min()
-        structure = generate_binary_structure(3,3)
-        if task == 'bvse':
-            labels, features = measurements.label(region < tr, structure = structure)
-        else:
-            labels, features = measurements.label(region > tr, structure = structure)
-        labels_with_pbc = self._apply_pbc(labels)
-        return labels_with_pbc, np.unique(labels_with_pbc)     # labels, features
-
-
-
-    def _apply_pbc(self, labels):
-        
-        """ 
-        Apply periodic boundary conditions to the NxMxL np.array of labeled points.
-
-        Parameters
-        ----------
-
-        labels: np.array of NxMxL size
-            array of labeles (connected components)
-        
-        Returns
-        ----------
-        
-        labels, features: np.array of NxMxL size and np.array of its unique labels
-            the array returned implies pbc conditions
-
-        """
-
-        faces_left = [labels[-1, :, :],
-                      labels[:, -1, :],
-                      labels[:, :, -1]
-                     ]
-        faces_right = [labels[0, :, :],
-                       labels[:, 0, :],
-                       labels[:, :, 0]
-                      ]
-        for f1, f2 in zip(faces_left, faces_right):
-            for s in np.unique(f1):
-                if s == 0:
-                    continue
-                else:
-                    connect = np.unique(f2[f1 == s])
-                    for c in connect:
-                        if c == 0:
-                            continue
-                        else:
-                            labels[labels == c] = s
-        return labels
-
-
-
-    def _percolation_dimension_old(self, labels, features):
-
-        """ 
-        Check percolation dimensionality
-
-        Old version.  Does not work here but used for tests with elder version.
-
-        Parameters
-        ----------
-
-        labels: np.array
-            label from _connected_components method
-            
-        features: np.array
-            label from _connected_components method
-        
-        Returns
-        ----------
-        d: dimensionality of percolation
-            Note: can be from 1 to 27, which is the number of neighboring unit cells within 3x3x3 supercell
-        """
-
-        if len(features) < 1:
-            d = 0
-        else:
-            ds = []
-            for feature in features:
-                if feature == 0:
-                    continue
-                else:
-                    coords = np.argwhere(labels == feature)
-                    ds.append(self._cross_boundary(coords, np.array(labels.shape)/3))
-            d = max(ds)
-        return d
-
-
-
-    def _percolation_dimension(self, labels, features):
-
-        """
-        Check percolation dimensionality
-
-        Parameters
-        ----------
-
-        labels: np.array
-            label from _connected_components method
-            
-        features: np.array
-            label from _connected_components method
-        
-        Returns
-        ----------
-        d: dimensionality of percolation
-            Note: can be from 2 to 8, which is the number of neighboring unit cells within 3x3x3 supercell
-        """
-
-        if len(features) < 1:
-            d = 0
-        else:
-            d = max(Parallel(n_jobs=self.n_jobs,
-                backend = self.backend)(delayed(self._percolation_dimension_parallel)(feature, labels) for feature in features))
-        return d
+        return morse + coulomb
     
 
 
-    def _percolation_dimension_parallel(self, feature, labels):
-
-        if feature == 0:
-            d = 0
-        else:
-            coords = np.argwhere(labels == feature)
-            d = self._cross_boundary(coords, np.array(labels.shape)/2)
-        return d
-
-
-    
     def _percolation_energy(self, dim, encut = 10.0):
 
         """
@@ -862,25 +751,7 @@ class Lain:
         """
         
         data = self.data.reshape(self.size)
-        data = data - data.min()
-        emin = data.min()
-        emax = emin + encut
-        count = 0
-        barrier = np.inf
-        while (emax - emin) > 0.01:
-            count = count + 1
-            probe = (emin + emax) / 2
-            labels, features = self._connected_components(data, probe)
-            if len(features) > 0:
-                d = self._percolation_dimension(labels, features)
-                if d >= dim:
-                    emax = probe
-                    barrier = round(emax,4)
-                else:
-                    emin = probe
-            else:
-                emin = probe
-        return barrier
+        return percolation.percolation_energy(data, dim, encut = encut)
 
 
 
@@ -896,10 +767,10 @@ class Lain:
             cutoff energy above which barriers supposed to be np.inf
 
         n_jobs: int, 1 by default
-            number of jobs to run for percolation energy search
+            not used, left for compatibility with the previous versions
 
         backend: str, 'threading' by default
-            see joblib's documentations for more details
+            not used, left for compatibility with the previous versions
 
         Returns
         ----------
@@ -912,13 +783,8 @@ class Lain:
         self.n_jobs = n_jobs
         self.backend = backend
 
-        energies = {}
-        for i, dim in enumerate([2, 4, 8]):
-            
-            energy = self._percolation_energy(encut = encut, dim = dim)
-            energies.update({f'E_{i+1}D': energy})
-
-        return energies
+        data = self.data.reshape(self.size)
+        return percolation.percolation_barriers(data, encut = encut)
     
 
 
@@ -932,10 +798,10 @@ class Lain:
         ----------
 
         n_jobs: int, 1 by default
-            number of jobs to run for percolation energy search
+            not used, left for compatibility with the previous versions
 
         backend: str, 'threading' by default
-            see joblib's documentations for more details
+            not used, left for compatibility with the previous versions
 
         Returns
         ----------
@@ -947,13 +813,7 @@ class Lain:
         self.n_jobs = n_jobs
         self.backend = backend
 
-        radii = {}
-        for i, dim in enumerate([2, 4, 8]):
-            
-            r = self._percolation_radius(dim = dim)
-            radii.update({f'r_{i+1}D': r})
-
-        return radii
+        return percolation.percolation_radii(self.void_data)
     
 
 
@@ -1003,16 +863,14 @@ class Lain:
             data = self.void_data
         voxels = data.shape[0] - 1, data.shape[1] - 1, data.shape[2] - 1
         cellpars = self.cell.cellpar()
+        values = np.asarray(data[:voxels[0], :voxels[1], :voxels[2]], dtype = np.float64)
         with open(f'{filename}.grd' , 'w') as report:
             comment = '# BVSE data made with bvlain package: https://github.com/dembart/BVlain'
             report.write(comment + '\n')
             report.write(''.join(str(p) + ' ' for p in cellpars).strip() + '\n')
             report.write(''.join(str(v) + ' ' for v in voxels).strip() + '\n')
-            for i in range(voxels[0]):
-                for j in range(voxels[1]):
-                    for k in range(voxels[2]):
-                        val = data[i, j, k]
-                        report.write(str(val) + '\n')
+            if values.size > 0:
+                report.write('\n'.join(map(repr, values.ravel().tolist())) + '\n')
     
 
     
@@ -1032,6 +890,8 @@ class Lain:
         pd.DataFrame
             structure data and misamtches
         """
+
+        import pandas as pd
 
         with open(self.cation_file, 'rb') as f:
             data_cation = pickle.load(f) 
