@@ -20,7 +20,6 @@ st = calc.read_file(file)
 params = {'mobile_ion': 'Li1+',
 		  'r_cut': 10.0,
 		  'resolution': 0.2,
-		  'k': 100
 }
 _ = calc.bvse_distribution(**params)
 energies = calc.percolation_barriers(encut = 5.0)

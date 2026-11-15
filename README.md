@@ -31,7 +31,6 @@ atoms = calc.read_file(file)       # alternatively, you can use read_atoms() or 
 params = {'mobile_ion': 'Li1+',              # mobile specie
 		  'r_cut': 10.0,                     # cutoff for interaction between the mobile species and framework
 		  'resolution': 0.2,	             # distance between the grid points
-		  'k': 100,                          # maximum number of neighbors to be collected for each point
           'use_softbv_covalent_radii': False # default is False, use True to compare results with softBV
 }
 _ = calc.bvse_distribution(**params)
@@ -43,6 +42,10 @@ for key in energies.keys():
     1D percolation barrier is 0.4395 eV
     2D percolation barrier is 3.3301 eV
     3D percolation barrier is 3.3594 eV
+
+By default all framework ions within `r_cut` are taken into account. The energies are summed up by a compiled ([numba](https://numba.pydata.org)) kernel, the first call takes a bit longer due to compilation. 
+
+Note: in the versions up to 0.25.1 only `k = 100` nearest framework ions within `r_cut` were considered. Summing up all the ions shifts the energies by a few meV, therefore percolation barriers may occasionally differ from the previous versions by one step of the bisection search (~0.01 eV). The old behavior (slower and memory expensive) is available via the `k` parameter, e.g. `calc.bvse_distribution(mobile_ion = 'Li1+', k = 100)`.
 
 
 
@@ -59,7 +62,6 @@ atoms = calc.read_file(file)
 params = {'mobile_ion': 'Li1+',    # mobile specie
 		  'r_cut': 10.0,           # cutoff for interaction between the mobile species and framework
 		  'resolution': 0.2,	   # distance between the grid points
-		  'k': 100                 # maximum number of neighbors to be collected for each point
 }
 _ = calc.bvse_distribution(**params)
 

@@ -2,14 +2,6 @@
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
-dependencies = [
-  "numpy",
-  "scipy",
-  "ase",
-  "pymatgen",
-  "joblib"
-]
-
 
 [project]
 name = "bvlain"
@@ -17,6 +9,14 @@ authors = [{name = "Artem Dembitskiy", email = "art.dembitskiy@gmail.com"}]
 dynamic = ["version", "description"]
 readme = "README.md"
 license = {file = "LICENSE"}
+dependencies = [
+  "numpy",
+  "pandas",
+  "scipy>=1.7.0",
+  "pymatgen>=2022.5.26",
+  "ase",
+  "numba"
+]
 
 
 [project.optional-dependencies]

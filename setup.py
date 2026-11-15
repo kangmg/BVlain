@@ -12,7 +12,7 @@ setuptools.setup(
                          "scipy>=1.7.0",
                          "pymatgen>=2022.5.26",
                          "ase",
-                         "joblib",
+                         "numba",
                          ],
      author="Artem Dembitskiy",
      author_email="art.dembitskiy@gmail.com",

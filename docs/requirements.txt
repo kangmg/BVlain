@@ -6,4 +6,4 @@ nbsphinx
 numpy
 pymatgen
 scipy
-joblib
+numba
